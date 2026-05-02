@@ -1,5 +1,6 @@
 name: Florida
-
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 on:
   schedule:
     - cron: "0 9/12 * * *"
@@ -8,111 +9,98 @@ on:
     branches: ["main", "ci"]
     paths:
       - ".github/workflows/build.yml"
-      - "patches/**"
 
 jobs: 
   check_version:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
 
     outputs:
-      FRIDA_VERSION: ${{ steps.pullFridaLatestRelease.outputs.FRIDA_VERSION }}
-      ALREADY_RELEASE: ${{ steps.checkReleaseVersion.outputs.ALREADY_RELEASE }}
+      FRIDA_VERSION: ${{ steps.get_version.outputs.version }}
+      ALREADY_RELEASE: ${{ steps.check.outputs.exists }}
+
     steps:
-      - name: Pull Frida Latest Release
-        id: pullFridaLatestRelease
-        uses: actions/github-script@v3
-        with:
-          github-token: ${{secrets.GITHUB_TOKEN}}
-          script: |
-            const releaseResponse = await github.repos.getLatestRelease({
-              owner: 'frida',
-              repo: 'frida',
-            })
-            const {
-              data: { tag_name: ver }
-            } = releaseResponse;
-            core.setOutput('FRIDA_VERSION', ver);
-
-      - name: Split Repository Name
-        id: split_name
+      - name: Get latest Frida version
+        id: get_version
         run: |
-          repo_name=${{ github.repository }}
-          IFS='/' read -ra repo_parts <<< "$repo_name"
-          echo "owner=${repo_parts[0]}" >> $GITHUB_OUTPUT
-          echo "repo=${repo_parts[1]}" >> $GITHUB_OUTPUT
+          VERSION=$(curl -s https://api.github.com/repos/frida/frida/releases/latest | jq -r .tag_name)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
 
-      - name: Check release version
-        id: checkReleaseVersion
-        uses: actions/github-script@v3
-        with:
-          github-token: ${{secrets.GITHUB_TOKEN}}
-          script: |
-            try {
-              const releaseVersion = '${{ steps.pullFridaLatestRelease.outputs.FRIDA_VERSION }}'
-              const releaseResponse = await github.repos.getReleaseByTag({
-                owner: '${{ steps.split_name.outputs.owner }}',
-                repo: '${{ steps.split_name.outputs.repo }}',
-                tag: releaseVersion
-              });
-              const {
-                data: { tag_name: ver }
-              } = releaseResponse;
-              if (ver == '${{ steps.pullFridaLatestRelease.outputs.FRIDA_VERSION }}'){
-                  if ( ${{ ( github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}){
-                    core.setOutput('ALREADY_RELEASE', '2');
-                  } else {
-                    core.setOutput('ALREADY_RELEASE', '1');
-                  }
-              }
-              else{
-                  core.setOutput('ALREADY_RELEASE', '0');
-              }
-            } catch (e) {
-              if(e.message == 'Not Found'){
-                core.setOutput('ALREADY_RELEASE', '0');
-              }
-              else{
-                core.setFailed(e.message);
-              }
-            }
-      
-      - name: Delete release
-        if: ${{ steps.checkReleaseVersion.outputs.ALREADY_RELEASE == '2' }}
-        uses: dev-drprasad/delete-tag-and-release@v1.0
-        with:
-          tag_name: ${{ steps.pullFridaLatestRelease.outputs.FRIDA_VERSION }}
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          delete_release: true
+      - name: Check if release exists
+        id: check
+        run: |
+          OWNER=$(echo "${{ github.repository }}" | cut -d'/' -f1)
+          REPO=$(echo "${{ github.repository }}" | cut -d'/' -f2)
+          VERSION="${{ steps.get_version.outputs.version }}"
+
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            https://api.github.com/repos/$OWNER/$REPO/releases/tags/$VERSION)
+
+          if [ "$STATUS" = "200" ]; then
+            if [[ "${{ github.event_name }}" == "push" || "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+              echo "exists=2" >> $GITHUB_OUTPUT
+            else
+              echo "exists=1" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "exists=0" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Delete release if needed
+        if: ${{ steps.check.outputs.exists == '2' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.get_version.outputs.version }}"
+          echo "[*] Deleting release $VERSION"
+          gh release delete "$VERSION" -y || true
+          git push --delete origin "$VERSION" || true
 
   create_release:
     needs: check_version
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     if: needs.check_version.outputs.ALREADY_RELEASE != '1'
 
     steps:
-      - uses: softprops/action-gh-release@v2.1.0
-        id: createRelease
-        name: Create Runner Release
+      - name: Create release (with original notes)
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: "${{ needs.check_version.outputs.FRIDA_VERSION }}"
-          name: "${{ needs.check_version.outputs.FRIDA_VERSION }}"
-          prerelease: false
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ needs.check_version.outputs.FRIDA_VERSION }}"
+
+          if gh release view "$VERSION" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "[*] Release exists, skipping"
+            exit 0
+          fi
+
+          echo "[*] Fetching original release notes from frida..."
+
+          NOTES=$(curl -s https://api.github.com/repos/frida/frida/releases/tags/$VERSION | jq -r .body)
+
+          if [ "$NOTES" = "null" ] || [ -z "$NOTES" ]; then
+            echo "[!] Failed to fetch notes, fallback"
+            NOTES="Auto release (no upstream notes found)"
+          fi
+
+          echo "[*] Creating release $VERSION"
+
+          gh release create "$VERSION" \
+            --repo "${{ github.repository }}" \
+            --title "$VERSION" \
+            --notes "$NOTES"
 
   android_build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     needs: [check_version, create_release]
+    if: needs.check_version.outputs.ALREADY_RELEASE != '1'
 
     steps:
-    - uses: actions/checkout@v3
-
-    - uses: actions/setup-node@v3
+    - uses: actions/checkout@v6
+    - uses: actions/setup-node@v6
       with:
-        node-version: 18
+        node-version: 24
 
     - name: Set up JDK 17
-      uses: actions/setup-java@v3
+      uses: actions/setup-java@v5
       with:
         distribution: "temurin"
         java-version: "17"
@@ -126,7 +114,7 @@ jobs:
         link-to-sdk: true
 
     - name: Set up Python 3.9
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v6
       with:
         python-version: 3.9
 
@@ -136,252 +124,726 @@ jobs:
         sudo gem install fpm -v 1.11.0 --no-document
         python3 -m pip install lief graphlib
 
-    - name: build frida for Android
+    - name: Clone frida
+      run: |
+        git clone --recurse-submodules https://github.com/frida/frida
+
+    - name: Patch rpc (string_frida_rpc)
       shell: bash
       run: |
-        git config --global user.name "GitHub Actions"
-        git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-        
+        set -euo pipefail
+
+        FILE="frida/subprojects/frida-core/lib/base/rpc.vala"
+
+        echo "[*] Checking file: $FILE"
+        [ -f "$FILE" ] || { echo "[FATAL] File not found"; exit 1; }
+
+        echo "[*] Running patch..."
+
+        python3 << 'PY'
+        from pathlib import Path
+        import sys
+
+        file_path = Path("frida/subprojects/frida-core/lib/base/rpc.vala")
+        text = file_path.read_text()
+
+        required_before = [
+            '.add_string_value ("frida:rpc")',
+            'json.index_of ("\\"frida:rpc\\"")',
+            'type != "frida:rpc"'
+        ]
+
+        for r in required_before:
+            if r not in text:
+                print(f"[FATAL] Pattern not found before patch: {r}")
+                sys.exit(1)
+
+        if "getRpcStr(bool quote)" not in text:
+            insert_block = """
+            public string getRpcStr(bool quote){
+                string result = (string) GLib.Base64.decode((string) GLib.Base64.decode("Wm5KcFpHRTZjbkJq"));
+                if(quote){
+                    return "\\""+ result + "\\"";
+                }else{
+                    return result;
+                }
+            }
+        """
+
+            if "public async Json.Node call" not in text:
+                print("[FATAL] Anchor for insertion not found")
+                sys.exit(1)
+
+            text = text.replace(
+                "public async Json.Node call",
+                insert_block + "\n\t\tpublic async Json.Node call",
+                1
+            )
+
+        replacements = {
+            '.add_string_value ("frida:rpc")': '.add_string_value (getRpcStr(false))',
+            'json.index_of ("\\"frida:rpc\\"")': 'json.index_of (getRpcStr(true))',
+            'type != "frida:rpc"': 'type != getRpcStr(false)',
+        }
+
+        for old, new in replacements.items():
+            if old not in text:
+                print(f"[FATAL] Missing pattern for replace: {old}")
+                sys.exit(1)
+            text = text.replace(old, new)
+
+        file_path.write_text(text)
+        text_after = file_path.read_text()
+
+        required_after = [
+            'getRpcStr(false)',
+            'getRpcStr(true)',
+            'public string getRpcStr(bool quote)'
+        ]
+
+        for r in required_after:
+            if r not in text_after:
+                print(f"[FATAL] Missing after patch: {r}")
+                sys.exit(1)
+
+        forbidden = [
+            '.add_string_value ("frida:rpc")',
+            'json.index_of ("\\"frida:rpc\\"")',
+            'type != "frida:rpc"'
+        ]
+
+        for f in forbidden:
+            if f in text_after:
+                print(f"[FATAL] Old pattern still exists: {f}")
+                sys.exit(1)
+
+        print("[✓] Patch applied and verified successfully")
+        PY
+
+        echo "[✓] rpc patch DONE"
+
+    - name: Patch frida_agent_so (random_prefix)
+      shell: bash
+      run: |
+        set -euo pipefail
+        FILE="frida/subprojects/frida-core/src/linux/linux-host-session.vala"
+        echo "[*] Checking file: $FILE"
+
+        if [ ! -f "$FILE" ]; then
+          echo "[FATAL] File not found"
+          exit 1
+        fi
+
+        if grep -q "random_prefix" "$FILE"; then
+          echo "[*] Already patched → skip"
+          exit 0
+        fi
+
+        BEFORE_COUNT=$(grep -o "frida-agent-<arch>.so" "$FILE" | wc -l || true)
+        echo "[*] Occurrences before patch: $BEFORE_COUNT"
+
+        CHANGES=$(python3 << 'PY'
+        from pathlib import Path
+
+        p = Path("frida/subprojects/frida-core/src/linux/linux-host-session.vala")
+        lines = p.read_text().splitlines(True)
+
+        out = []
+        inside_block = False
+        changes = 0
+
+        for i, line in enumerate(lines):
+            if 'agent = new AgentDescriptor (PathTemplate ("frida-agent-<arch>.so")' in line:
+                indent = line[:len(line) - len(line.lstrip())]
+                out.append(indent + "var random_prefix = GLib.Uuid.string_random();\n")
+
+                line = line.replace(
+                    '"frida-agent-<arch>.so"',
+                    'random_prefix + "-<arch>.so"'
+                )
+
+                inside_block = True
+                changes += 1
+
+            if inside_block:
+                if '"frida-agent-arm.so"' in line:
+                    line = line.replace(
+                        '"frida-agent-arm.so"',
+                        'random_prefix + "-arm.so"'
+                    )
+                    changes += 1
+
+                if '"frida-agent-arm64.so"' in line:
+                    line = line.replace(
+                        '"frida-agent-arm64.so"',
+                        'random_prefix + "-arm64.so"'
+                    )
+                    changes += 1
+
+                if '},' in line:
+                    inside_block = False
+
+            out.append(line)
+        p.write_text("".join(out))
+        print(changes)
+        PY
+        )
+
+        echo "[*] Changes applied: $CHANGES"
+        AFTER_LEFT=$(grep -o "frida-agent-<arch>.so" "$FILE" | wc -l || true)
+        echo "[*] Remaining original patterns: $AFTER_LEFT"
+
+        if [ "$CHANGES" -eq 0 ]; then
+          echo "[FATAL] No changes applied at all"
+          exit 1
+        fi
+
+        if [ "$AFTER_LEFT" -ne 0 ]; then
+          echo "[FATAL] Some patterns were NOT replaced ($AFTER_LEFT left)"
+          exit 1
+        fi
+
+        if ! grep -q "random_prefix" "$FILE"; then
+          echo "[FATAL] random_prefix not injected"
+          exit 1
+        fi
+
+        echo "[✓] Patch fully validated and applied"
+
+    - name: Patch entrypoints
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        FILES=(
+          "frida/subprojects/frida-core/src/agent-container.vala"
+          "frida/subprojects/frida-core/src/darwin/darwin-host-session.vala"
+          "frida/subprojects/frida-core/src/freebsd/freebsd-host-session.vala"
+          "frida/subprojects/frida-core/src/linux/linux-host-session.vala"
+          "frida/subprojects/frida-core/src/qnx/qnx-host-session.vala"
+          "frida/subprojects/frida-core/src/windows/windows-host-session.vala"
+          "frida/subprojects/frida-core/tests/test-agent.vala"
+          "frida/subprojects/frida-core/tests/test-injector.vala"
+        )
+
+        TOTAL_FILES=0
+        TOTAL_PATCHED=0
+        TOTAL_FOUND=0
+
+        for f in "${FILES[@]}"; do
+          echo "----------------------------------------"
+          echo "[*] Checking: $f"
+
+          if [ ! -f "$f" ]; then
+            echo "[FATAL] File NOT found: $f"
+            exit 1
+          fi
+
+          TOTAL_FILES=$((TOTAL_FILES + 1))
+          COUNT=$(grep -c 'frida_agent_main' "$f" || true)
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "[FATAL] Pattern not found in $f (frida changed upstream?)"
+            exit 1
+          fi
+
+          TOTAL_FOUND=$((TOTAL_FOUND + COUNT))
+          echo "[*] Found $COUNT occurrences"
+          sed -i 's/"frida_agent_main"/"main"/g' "$f"
+          AFTER=$(grep -c 'frida_agent_main' "$f" || true)
+
+          if [ "$AFTER" -ne 0 ]; then
+            echo "[FATAL] Patch FAILED in $f ($AFTER remaining)"
+            exit 1
+          fi
+
+          echo "[+] Patch SUCCESS ($COUNT replaced)"
+          TOTAL_PATCHED=$((TOTAL_PATCHED + 1))
+        done
+
+        echo "========================================"
+        echo "[*] Files checked:  $TOTAL_FILES"
+        echo "[*] Files patched:  $TOTAL_PATCHED"
+        echo "[*] Total replaced: $TOTAL_FOUND"
+
+        if [ "$TOTAL_PATCHED" -ne "$TOTAL_FILES" ]; then
+          echo "[FATAL] Not all files patched"
+          exit 1
+        fi
+
+    - name: Patch protocol_unexpected_command
+      shell: bash
+      run: |
+        set -euo pipefail
+        FILE="frida/subprojects/frida-core/src/droidy/droidy-client.vala"
+        echo "[*] Checking file: $FILE"
+
+        if [ ! -f "$FILE" ]; then
+          echo "[FATAL] File not found: $FILE"
+          exit 1
+        fi
+
+        PATTERN='throw new Error.PROTOCOL ("Unexpected command");'
+        BEFORE=$(grep -F "$PATTERN" "$FILE" | wc -l || true)
+        echo "[*] Matches before patch: $BEFORE"
+
+        if [ "$BEFORE" -eq 0 ]; then
+          echo "[FATAL] Pattern not found → Frida upstream changed or already patched"
+          exit 1
+        fi
+
+        echo "[*] Applying patch..."
+        sed -i 's|throw new Error.PROTOCOL ("Unexpected command");|break;|g' "$FILE"
+        AFTER=$(grep -F "$PATTERN" "$FILE" | wc -l || true)
+        echo "[*] Remaining original patterns: $AFTER"
+
+        if [ "$AFTER" -ne 0 ]; then
+          echo "[FATAL] Patch FAILED — some patterns still exist"
+          exit 1
+        fi
+
+        echo "[✓] Patch successfully applied and verified"
+
+    - name: Patch frida-glue (pool-frida)
+      shell: bash
+      run: |
+        set -euo pipefail
+        FILE="frida/subprojects/frida-core/src/frida-glue.c"
+        echo "[*] Checking file: $FILE"
+
+        if [ ! -f "$FILE" ]; then
+          echo "[FATAL] File not found"
+          exit 1
+        fi
+
+        BEFORE=$(grep -F 'g_set_prgname ("ggbond")' "$FILE" | wc -l || true)
+        echo "[*] Already patched count: $BEFORE"
+
+        if [ "$BEFORE" -gt 0 ]; then
+          echo "[*] Already patched, skipping"
+          exit 0
+        fi
+
+        python3 << 'PY'
+        from pathlib import Path
+
+        path = Path("frida/subprojects/frida-core/src/frida-glue.c")
+        text = path.read_text().splitlines(True)
+
+        out = []
+        inserted = False
+        found_anchor = False
+
+        for i, line in enumerate(text):
+            out.append(line)
+
+            if "g_io_module_openssl_register" in line:
+                found_anchor = True
+                indent = line[:len(line) - len(line.lstrip())]
+
+                j = i + 1
+                while j < len(text):
+                    if "#endif" in text[j]:
+                        out.append(indent + "g_set_prgname (\"ggbond\");\n")
+                        inserted = True
+                        break
+                    if text[j].strip() != "":
+                        out.append(indent + "g_set_prgname (\"ggbond\");\n")
+                        inserted = True
+                        break
+                    j += 1
+
+        if not found_anchor:
+            raise SystemExit("[FATAL] Anchor g_io_module_openssl_register not found")
+
+        if not inserted:
+            raise SystemExit("[FATAL] Failed to insert patch")
+
+        path.write_text("".join(out))
+        print("[✓] Patch applied")
+        PY
+
+        echo "[*] Verifying..."
+
+        if ! grep -q 'g_set_prgname ("ggbond")' "$FILE"; then
+          echo "[FATAL] Patch verification failed"
+          exit 1
+        fi
+
+        echo "[✓] OK"
+
+    - name: Patch memfd (jit-cache)
+      shell: bash
+      run: |
+        set -euo pipefail
+        FILE="frida/subprojects/frida-core/lib/base/linux.vala"
+        echo "[*] Checking file: $FILE"
+        [ -f "$FILE" ] || { echo "[FATAL] File not found"; exit 1; }
+        PATTERN='Linux.syscall (LinuxSyscall.MEMFD_CREATE, name, flags)'
+        REPLACEMENT='Linux.syscall (LinuxSyscall.MEMFD_CREATE, "jit-cache", flags)'
+        BEFORE=$(grep -F "$PATTERN" "$FILE" | wc -l || true)
+        echo "[*] Matches before patch: $BEFORE"
+
+        if [ "$BEFORE" -eq 0 ]; then
+          echo "[FATAL] Pattern not found → upstream changed or already patched"
+          exit 1
+        fi
+
+        echo "[*] Applying patch..."
+        sed -i "s|$PATTERN|$REPLACEMENT|g" "$FILE"
+        AFTER=$(grep -F "$PATTERN" "$FILE" | wc -l || true)
+        echo "[*] Remaining old patterns: $AFTER"
+
+        if [ "$AFTER" -ne 0 ]; then
+          echo "[FATAL] Patch FAILED — old pattern still exists"
+          exit 1
+        fi
+
+        NEW_COUNT=$(grep -F "$REPLACEMENT" "$FILE" | wc -l || true)
+        echo "[*] New pattern count: $NEW_COUNT"
+
+        if [ "$NEW_COUNT" -eq 0 ]; then
+          echo "[FATAL] Replacement not found after patch"
+          exit 1
+        fi
+
+        echo "[✓] memfd patch applied and verified successfully"
+
+    - name: Patch gum (pool-frida)
+      shell: bash
+      run: |
+        set -euo pipefail
+        FILE="frida/subprojects/frida-gum/gum/gum.c"
+        echo "[*] Checking file: $FILE"
+        [ -f "$FILE" ] || { echo "[FATAL] File not found"; exit 1; }
+
+        PATTERN='g_set_prgname ("frida")'
+        REPLACEMENT='g_set_prgname ("ggbond")'
+
+        BEFORE=$(grep -F "$PATTERN" "$FILE" | wc -l || true)
+        echo "[*] Matches before patch: $BEFORE"
+
+        if [ "$BEFORE" -eq 0 ]; then
+          echo "[FATAL] Pattern not found → upstream changed or already patched"
+          exit 1
+        fi
+
+        echo "[*] Applying patch..."
+        sed -i "s|$PATTERN|$REPLACEMENT|g" "$FILE"
+
+        AFTER=$(grep -F "$PATTERN" "$FILE" | wc -l || true)
+        echo "[*] Remaining old patterns: $AFTER"
+
+        if [ "$AFTER" -ne 0 ]; then
+          echo "[FATAL] Patch FAILED — old pattern still exists"
+          exit 1
+        fi
+
+        NEW_COUNT=$(grep -F "$REPLACEMENT" "$FILE" | wc -l || true)
+        echo "[*] New pattern count: $NEW_COUNT"
+
+        if [ "$NEW_COUNT" -eq 0 ]; then
+          echo "[FATAL] Replacement not found after patch"
+          exit 1
+        fi
+
+        echo "[✓] gum patch applied and verified successfully"
+
+    - name: Create anti-anti-frida.py
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        FILE="frida/subprojects/frida-core/src/anti-anti-frida.py"
+        DIR="$(dirname "$FILE")"
+
+        echo "[*] Writing script: $FILE"
+
+        python3 << 'PY'
+        from pathlib import Path
+        import textwrap
+
+        file_path = Path("frida/subprojects/frida-core/src/anti-anti-frida.py")
+        content = textwrap.dedent(r"""
+        import lief
+        import sys
+        import random
+        from pathlib import Path
+
+        def log(msg):
+            print(f"[anti-anti-frida] {msg}")
+
+        def replace_file(path, old, new):
+            path = Path(path)
+
+            if isinstance(old, str):
+                old = old.encode()
+            if isinstance(new, str):
+                new = new.encode()
+
+            data = path.read_bytes()
+
+            if old not in data:
+                log(f"[!] not found: {old}")
+                return False
+
+            new_data = data.replace(old, new)
+
+            if new_data == data:
+                log(f"[!] no change: {old}")
+                return False
+
+            path.write_bytes(new_data)
+            log(f"[✓] replaced")
+            return True
+
+        if __name__ == "__main__":
+            input_file = sys.argv[1]
+            log(f"target: {input_file}")
+            seed = input_file.encode()
+            random.seed(seed)
+            charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+            binary = lief.parse(input_file)
+            if not binary:
+                log("[!] not ELF, skipping")
+                sys.exit(0)
+
+            rnd = "".join(random.sample(charset, 5))
+            log(f"frida -> {rnd}")
+
+            for s in binary.symbols:
+                if s.name == "frida_agent_main":
+                    s.name = "main"
+                if "frida" in s.name:
+                    s.name = s.name.replace("frida", rnd)
+                if "FRIDA" in s.name:
+                    s.name = s.name.replace("FRIDA", rnd)
+
+            targets = ["FridaScriptEngine", "GLib-GIO", "GDBusProxy", "GumScript"]
+
+            for sec in binary.sections:
+                if sec.name != ".rodata":
+                    continue
+
+                for t in targets:
+                    for addr in sec.search_all(t):
+                        patch = list(t[::-1].encode())
+                        log(f"patch {t} @ {hex(sec.file_offset + addr)}")
+                        binary.patch_address(sec.file_offset + addr, patch)
+
+            binary.write(input_file)
+
+            log("[*] string patches start")
+
+            rnd = "".join(random.sample(charset, 11))
+            log(f"gum-js-loop -> {rnd}")
+            if not replace_file(input_file, "gum-js-loop", rnd):
+                sys.exit("[FATAL] gum-js-loop failed")
+
+            rnd = "".join(random.sample(charset, 5))
+            log(f"gmain -> {rnd}")
+            if not replace_file(input_file, "gmain", rnd):
+                sys.exit("[FATAL] gmain failed")
+
+            rnd = "".join(random.sample(charset, 5))
+            log(f"gdbus -> {rnd}")
+            if not replace_file(input_file, "gdbus", rnd):
+                sys.exit("[FATAL] gdbus failed")
+
+            log("[✓] DONE")
+        """).strip() + "\n"
+
+        file_path.write_text(content, encoding="utf-8")
+        print("[✓] file written:", file_path)
+        PY
+
+        echo "[*] Verifying file..."
+
+        if [ ! -f "$FILE" ]; then
+          echo "[FATAL] File was NOT created: $FILE"
+          exit 1
+        fi
+
+        if [ ! -s "$FILE" ]; then
+          echo "[FATAL] File is empty: $FILE"
+          exit 1
+        fi
+
+        if ! grep -q "anti-anti-frida" "$FILE"; then
+          echo "[FATAL] File content invalid"
+          exit 1
+        fi
+
+        echo "[✓] File created and verified"
+        ls -lah "$FILE"
+
+    - name: Patch embed-agent (run anti-anti-frida)
+      shell: bash
+      run: |
+        set -euo pipefail
+        FILE="frida/subprojects/frida-core/src/embed-agent.py"
+        echo "[*] Checking file: $FILE"
+
+        if [ ! -f "$FILE" ]; then
+          echo "[FATAL] File not found"
+          exit 1
+        fi
+
+        BEFORE=$(grep -F "anti-anti-frida finished" "$FILE" | wc -l || true)
+        echo "[*] Already patched count: $BEFORE"
+
+        if [ "$BEFORE" -gt 0 ]; then
+          echo "[*] Already patched, skipping"
+          exit 0
+        fi
+
+        python3 << 'PY'
+        from pathlib import Path
+
+        path = Path("frida/subprojects/frida-core/src/embed-agent.py")
+        lines = path.read_text().splitlines(True)
+
+        out = []
+        found = False
+        inserted = False
+
+        for line in lines:
+            if "embedded_assets += [embedded_agent]" in line:
+                found = True
+                indent = line[:len(line) - len(line.lstrip())]
+
+                patch = [
+                    indent + "import os\n",
+                    indent + "custom_script = str(output_dir) + \"/../../../../frida/subprojects/frida-core/src/anti-anti-frida.py\"\n",
+                    indent + "return_code = os.system(\"python3 \" + custom_script + \" \" + str(priv_dir / f\"frida-agent-{flavor}.so\"))\n",
+                    indent + "if return_code == 0:\n",
+                    indent + "    print(f\"[anti-anti-frida] done: frida-agent-{flavor}.so\")\n",
+                    indent + "else:\n",
+                    indent + "    print(\"anti-anti-frida error. Code:\", return_code)\n",
+                ]
+
+                out.extend(patch)
+                inserted = True
+                print("[✓] patch inserted")
+
+            out.append(line)
+
+        if not found:
+            raise SystemExit("[FATAL] anchor 'embedded_assets += [embedded_agent]' not found")
+
+        if not inserted:
+            raise SystemExit("[FATAL] patch was NOT inserted")
+
+        path.write_text("".join(out))
+        print("[✓] file written")
+        PY
+
+        echo "[*] Verifying patch..."
+        if ! grep -q "anti-anti-frida finished" "$FILE"; then
+          echo "[FATAL] Patch verification failed"
+          exit 1
+        fi
+        echo "[✓] Patch applied successfully"
+
+    - name: Build frida for Android
+      shell: bash
+      run: |
+        set -e
+
         export ANDROID_NDK_ROOT=${{ steps.setup-ndk.outputs.ndk-path }}
         echo "ANDROID_NDK_ROOT=$ANDROID_NDK_ROOT"
-        
-        git clone --recurse-submodules https://github.com/frida/frida
-        cd frida
-        for path in ../patches/*
-        do
-          name=$(basename $path)
-          real=$(realpath $path)
-          echo "Apply patches in $real to frida/subprojects/$name"
-          cd subprojects/$name
-          git am ../../../patches/$name/*.patch
-          cd ../..
-          echo $i
-        done
-        cd ..
-        
-        ARCHES="android-arm android-arm64 android-x86 android-x86_64"
-        for ARCH in $ARCHES
-        do
-          mkdir build-$ARCH
-          cd build-$ARCH
-          ../frida/configure --host=$ARCH
-          make
-          cd ..
-        done
-    
-    - name: Split Repository Name
-      id: split_name
-      run: |
-        repo_name=${{ github.repository }}
-        IFS='/' read -ra repo_parts <<< "$repo_name"
-        echo "owner=${repo_parts[0]}" >> $GITHUB_OUTPUT
-        echo "repo=${repo_parts[1]}" >> $GITHUB_OUTPUT
 
-    - name: Check release version
-      id: checkReleaseVersion
-      uses: actions/github-script@v3
-      with:
-        github-token: ${{secrets.GITHUB_TOKEN}}
-        script: |
-          try {
-            const releaseVersion = '${{ needs.check_version.outputs.FRIDA_VERSION }}'
-            const releaseResponse = await github.repos.getReleaseByTag({
-              owner: '${{ steps.split_name.outputs.owner }}',
-              repo: '${{ steps.split_name.outputs.repo }}',
-              tag: releaseVersion
-            })
-            const {
-              data: { id: releaseId, html_url: htmlUrl, upload_url: uploadUrl }
-            } = releaseResponse;
-            core.setOutput('id', releaseId);
-            core.setOutput('html_url', htmlUrl);
-            core.setOutput('upload_url', uploadUrl);
-            core.setOutput('version', releaseVersion);
-          } catch (e) {
-            core.setFailed(e.message);
-          }
+        ARCHES=("android-arm" "android-arm64" "android-x86" "android-x86_64")
 
-    - name: package build result for Android
+        for arch in "${ARCHES[@]}"; do
+          echo "[*] Building $arch"
+          build_dir="build-$arch"
+          rm -rf "$build_dir"
+          mkdir -p "$build_dir"
+          pushd "$build_dir" >/dev/null
+          ../frida/configure --host="$arch"
+          ninja
+          popd >/dev/null
+        done
+
+    - name: Package build result for Android
       shell: bash
       run: |
+        set -e
+        ARCHES=("android-arm" "android-arm64" "android-x86" "android-x86_64")
+        FILES=(
+          "subprojects/frida-core/server/frida-server"
+          "subprojects/frida-core/inject/frida-inject"
+          "subprojects/frida-core/lib/gadget/frida-gadget.so"
+          "subprojects/frida-gum/bindings/gumjs/libfrida-gumjs-1.0.a"
+        )
+        for arch in "${ARCHES[@]}"; do
+          for file in "${FILES[@]}"; do
+            full_path="build-$arch/$file"
         
-        gzip build-android-arm/subprojects/frida-core/server/frida-server
-        gzip build-android-arm64/subprojects/frida-core/server/frida-server
-        gzip build-android-x86/subprojects/frida-core/server/frida-server
-        gzip build-android-x86_64/subprojects/frida-core/server/frida-server
-        
-        gzip build-android-arm/subprojects/frida-core/inject/frida-inject
-        gzip build-android-arm64/subprojects/frida-core/inject/frida-inject
-        gzip build-android-x86/subprojects/frida-core/inject/frida-inject
-        gzip build-android-x86_64/subprojects/frida-core/inject/frida-inject
-        
-        gzip build-android-arm/subprojects/frida-core/lib/gadget/frida-gadget.so
-        gzip build-android-arm64/subprojects/frida-core/lib/gadget/frida-gadget.so
-        gzip build-android-x86/subprojects/frida-core/lib/gadget/frida-gadget.so
-        gzip build-android-x86_64/subprojects/frida-core/lib/gadget/frida-gadget.so
+            [ -f "$full_path" ] && gzip "$full_path" &
+          done
+        done     
+        wait
 
-        gzip build-android-arm/subprojects/frida-gum/bindings/gumjs/libfrida-gumjs-1.0.a
-        gzip build-android-arm64/subprojects/frida-gum/bindings/gumjs/libfrida-gumjs-1.0.a
-        gzip build-android-x86/subprojects/frida-gum/bindings/gumjs/libfrida-gumjs-1.0.a
-        gzip build-android-x86_64/subprojects/frida-gum/bindings/gumjs/libfrida-gumjs-1.0.a
-        
+    - name: Upload all assets
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        set -e
 
-    - name: Upload android arm frida-server for Florida
-      uses: actions/upload-release-asset@v1.0.2
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: '${{ steps.checkReleaseVersion.outputs.upload_url }}'
-        asset_path: '${{ github.workspace }}/build-android-arm/subprojects/frida-core/server/frida-server.gz'
-        asset_name: 'florida-server-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm.gz'
-        asset_content_type: application/octet-stream
+        VERSION="${{ needs.check_version.outputs.FRIDA_VERSION }}"
 
-    - name: Upload android arm64 frida-server for Florida
-      uses: actions/upload-release-asset@v1.0.2
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: '${{ steps.checkReleaseVersion.outputs.upload_url }}'
-        asset_path: '${{ github.workspace }}/build-android-arm64/subprojects/frida-core/server/frida-server.gz'
-        asset_name: 'florida-server-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm64.gz'
-        asset_content_type: application/octet-stream
+        UPLOAD_URL=$(gh release view "$VERSION" --json uploadUrl -q .uploadUrl)
+        UPLOAD_URL="${UPLOAD_URL%\{*}"
 
-    - name: Upload android x86 frida-server for Florida
-      uses: actions/upload-release-asset@v1.0.2
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: '${{ steps.checkReleaseVersion.outputs.upload_url }}'
-        asset_path: '${{ github.workspace }}/build-android-x86/subprojects/frida-core/server/frida-server.gz'
-        asset_name: 'florida-server-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-x86.gz'
-        asset_content_type: application/octet-stream
+        upload_file() {
+          file="$1"
+          filename=$(basename "$file")
 
-    - name: Upload android x86_64 frida-server for Florida
-      uses: actions/upload-release-asset@v1.0.2
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: '${{ steps.checkReleaseVersion.outputs.upload_url }}'
-        asset_path: '${{ github.workspace }}/build-android-x86_64/subprojects/frida-core/server/frida-server.gz'
-        asset_name: 'florida-server-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-x86_64.gz'
-        asset_content_type: application/octet-stream
-        
-    - name: Upload android arm frida-inject for Florida
-      uses: actions/upload-release-asset@v1.0.2
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: '${{ steps.checkReleaseVersion.outputs.upload_url }}'
-        asset_path: '${{ github.workspace }}/build-android-arm/subprojects/frida-core/inject/frida-inject.gz'
-        asset_name: 'florida-inject-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm.gz'
-        asset_content_type: application/octet-stream
-        
-    - name: Upload android arm64 frida-inject for Florida
-      uses: actions/upload-release-asset@v1.0.2
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: '${{ steps.checkReleaseVersion.outputs.upload_url }}'
-        asset_path: '${{ github.workspace }}/build-android-arm64/subprojects/frida-core/inject/frida-inject.gz'
-        asset_name: 'florida-inject-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm64.gz'
-        asset_content_type: application/octet-stream
-        
-    - name: Upload android x86 frida-inject for Florida
-      uses: actions/upload-release-asset@v1.0.2
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: '${{ steps.checkReleaseVersion.outputs.upload_url }}'
-        asset_path: '${{ github.workspace }}/build-android-x86/subprojects/frida-core/inject/frida-inject.gz'
-        asset_name: 'florida-inject-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-x86.gz'
-        asset_content_type: application/octet-stream
-        
-    - name: Upload android x86_64 frida-inject for Florida
-      uses: actions/upload-release-asset@v1.0.2
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: '${{ steps.checkReleaseVersion.outputs.upload_url }}'
-        asset_path: '${{ github.workspace }}/build-android-x86_64/subprojects/frida-core/inject/frida-inject.gz'
-        asset_name: 'florida-inject-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm-x86_64.gz'
-        asset_content_type: application/octet-stream
-    
-    - name: Upload android arm frida-gadget for Florida
-      uses: actions/upload-release-asset@v1.0.2
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: '${{ steps.checkReleaseVersion.outputs.upload_url }}'
-        asset_path: '${{ github.workspace }}/build-android-arm/subprojects/frida-core/lib/gadget/frida-gadget.so.gz'
-        asset_name: 'florida-gadget-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm.so.gz'
-        asset_content_type: application/octet-stream
+          case "$file" in
+            *android-arm64/*) arch="android-arm64" ;;
+            *android-arm/*) arch="android-arm" ;;
+            *android-x86_64/*) arch="android-x86_64" ;;
+            *android-x86/*) arch="android-x86" ;;
+            *) return ;;
+          esac
 
-    - name: Upload android arm64 frida-gadget for Florida
-      uses: actions/upload-release-asset@v1.0.2
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: '${{ steps.checkReleaseVersion.outputs.upload_url }}'
-        asset_path: '${{ github.workspace }}/build-android-arm64/subprojects/frida-core/lib/gadget/frida-gadget.so.gz'
-        asset_name: 'florida-gadget-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm64.so.gz'
-        asset_content_type: application/octet-stream
-   
-    - name: Upload android x86 frida-gadget for Florida
-      uses: actions/upload-release-asset@v1.0.2
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: '${{ steps.checkReleaseVersion.outputs.upload_url }}'
-        asset_path: '${{ github.workspace }}/build-android-x86/subprojects/frida-core/lib/gadget/frida-gadget.so.gz'
-        asset_name: 'florida-gadget-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-x86.so.gz'
-        asset_content_type: application/octet-stream
+          case "$filename" in
+            frida-server.gz)
+              name="florida-server-${VERSION}-${arch}.gz"
+              ;;
+            frida-inject.gz)
+              name="florida-inject-${VERSION}-${arch}.gz"
+              ;;
+            frida-gadget.so.gz)
+              name="florida-gadget-${VERSION}-${arch}.so.gz"
+              ;;
+            libfrida-gumjs-1.0.a.gz)
+              name="florida-gumjs-${VERSION}-${arch}.a.gz"
+              ;;
+            *)
+              return
+              ;;
+          esac
 
-    - name: Upload android x86_64 frida-gadget for Florida
-      uses: actions/upload-release-asset@v1.0.2
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: '${{ steps.checkReleaseVersion.outputs.upload_url }}'
-        asset_path: '${{ github.workspace }}/build-android-x86_64/subprojects/frida-core/lib/gadget/frida-gadget.so.gz'
-        asset_name: 'florida-gadget-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-x86_64.so.gz'
-        asset_content_type: application/octet-stream
-     
-    - name: Upload android arm frida-gumjs for Florida
-      uses: actions/upload-release-asset@v1.0.2
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: '${{ steps.checkReleaseVersion.outputs.upload_url }}'
-        asset_path: '${{ github.workspace }}/build-android-arm/subprojects/frida-gum/bindings/gumjs/libfrida-gumjs-1.0.a.gz'
-        asset_name: 'florida-gumjs-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm.a.gz'
-        asset_content_type: application/octet-stream
+          echo "[*] Uploading $name"
 
-    - name: Upload android arm64 frida-gumjs for Florida
-      uses: actions/upload-release-asset@v1.0.2
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: '${{ steps.checkReleaseVersion.outputs.upload_url }}'
-        asset_path: '${{ github.workspace }}/build-android-arm64/subprojects/frida-gum/bindings/gumjs/libfrida-gumjs-1.0.a.gz'
-        asset_name: 'florida-gumjs-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm64.a.gz'
-        asset_content_type: application/octet-stream
-   
-    - name: Upload android x86 frida-gumjs for Florida
-      uses: actions/upload-release-asset@v1.0.2
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: '${{ steps.checkReleaseVersion.outputs.upload_url }}'
-        asset_path: '${{ github.workspace }}/build-android-x86/subprojects/frida-gum/bindings/gumjs/libfrida-gumjs-1.0.a.gz'
-        asset_name: 'florida-gumjs-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-x86.a.gz'
-        asset_content_type: application/octet-stream
+          curl -sSL \
+            -X POST \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @"$file" \
+            "${UPLOAD_URL}?name=${name}"
+        }
 
-    - name: Upload android x86_64 frida-gumjs for Florida
-      uses: actions/upload-release-asset@v1.0.2
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: '${{ steps.checkReleaseVersion.outputs.upload_url }}'
-        asset_path: '${{ github.workspace }}/build-android-x86_64/subprojects/frida-gum/bindings/gumjs/libfrida-gumjs-1.0.a.gz'
-        asset_name: 'florida-gumjs-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-x86_64.a.gz'
-        asset_content_type: application/octet-stream
+        export -f upload_file
+        export VERSION
+        export GITHUB_TOKEN
+        export UPLOAD_URL
+
+        find build-* -type f -name "*.gz" | while read f; do
+          upload_file "$f" &
+        done  
+        wait
