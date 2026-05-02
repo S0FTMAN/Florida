@@ -740,7 +740,7 @@ jobs:
         PY
 
         echo "[*] Verifying patch..."
-        if ! grep -q "anti-anti-frida finished" "$FILE"; then
+        if ! grep -q "\[anti-anti-frida\] done:" "$FILE"; then
           echo "[FATAL] Patch verification failed"
           exit 1
         fi
